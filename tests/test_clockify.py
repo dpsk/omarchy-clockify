@@ -14,6 +14,10 @@ KEY = "A" * 48
 USER = "a" * 24
 WS = "b" * 24
 PROJECT = "c" * 24
+ENTRY = "e" * 24
+TASK = "f" * 24
+TAG = "1" * 24
+FIELD = "2" * 24
 
 
 class TempHome(unittest.TestCase):
@@ -217,6 +221,22 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(clockify.safe_color("#03A9F4"), "#03A9F4")
         self.assertEqual(clockify.safe_color("red; x"), "")
 
+    def test_clean_description_keeps_lines(self):
+        self.assertEqual(clockify.clean_description("  Fix bug \r\n- step\x00 one\r\n\n\n\n- two\t x \n\n"),
+                         "Fix bug\n- step one\n\n- two x")
+        self.assertEqual(clockify.clean_description("\n\nx"), "x")
+        self.assertEqual(clockify.clean_description("a\u2028b\u202ec"), "a bc")
+        self.assertEqual(len(clockify.clean_description("x\n" * 5000)), clockify.MAX_DESCRIPTION - 1)
+        self.assertEqual(clockify.clean_description(None), "")
+
+    def test_history_keeps_every_finished_entry(self):
+        e = lambda i, d, end: {"id": i * 24, "description": d,
+                               "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": end}}
+        out = clockify.history_view([e("1", "A", "2026-01-01T01:00:00Z"), e("2", "A", "2026-01-01T02:00:00Z"),
+                                     e("3", "Running", None), "junk"])
+        self.assertEqual([x["id"] for x in out], ["1" * 24, "2" * 24])
+        self.assertEqual(out[0]["end"], "2026-01-01T01:00:00Z")
+
     def test_recent_dedupes(self):
         e = lambda d, p: {"id": USER, "description": d, "projectId": p, "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}
         out = clockify.recent_view([e("A", PROJECT), e("a", PROJECT), e("B", ""), e("", ""), "junk"])
@@ -231,6 +251,13 @@ class CommandTests(TempHome):
         self.settings = {}
         self.recent = []
         self.projects_payload = [{"id": PROJECT, "name": "P", "color": "#ff0000"}]
+        self.entry = {
+            "id": ENTRY, "userId": USER, "workspaceId": WS, "description": "Old", "projectId": PROJECT,
+            "taskId": TASK, "tagIds": [TAG], "billable": True, "type": "REGULAR", "isLocked": False,
+            "customFieldValues": [{"customFieldId": FIELD, "name": "Ticket", "timeEntryId": ENTRY,
+                                   "type": "TIMEENTRY", "value": "T-1"}],
+            "timeInterval": {"start": "2026-01-01T09:00:07Z", "end": "2026-01-01T10:30:00Z"},
+        }
 
     def handler(self, req):
         self.calls.append((req.get_method(), req.full_url.split("/api/v1", 1)[1], req.data))
@@ -245,6 +272,13 @@ class CommandTests(TempHome):
             return {"id": WS, "workspaceSettings": self.settings}
         if "/projects" in path:
             return self.projects_payload
+        if path.startswith(f"/workspaces/{WS}/time-entries/"):
+            if req.get_method() == "GET":
+                return self.entry if self.entry is not None else http_error(404)
+            if req.get_method() == "PUT":
+                return dict(self.entry, **json.loads(req.data))
+            if req.get_method() == "DELETE":
+                return b""
         if req.get_method() == "PATCH":
             return http_error(404)
         if req.get_method() == "POST":
@@ -287,7 +321,7 @@ class CommandTests(TempHome):
         self.calls.clear()
         out = self.run_cmd("status")
         paths = sorted(p.split("?")[0] for _, p, _ in self.calls)
-        self.assertEqual(len(paths), 2)  # running + recent; projects and rules are cached
+        self.assertEqual(len(paths), 3)  # running, recent, history; projects and rules are cached
         self.assertEqual(out["recent"][0]["project"]["name"], "P")
 
     def test_unknown_project_refetches_projects_once(self):
@@ -399,6 +433,124 @@ class CommandTests(TempHome):
         out = self.run_cmd("stop")
         self.assertTrue(out["ok"])
         self.assertIsNone(out["running"])
+
+    def run_stdin(self, command, data):
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(data) + "\n")):
+            return self.run_cmd(command, "--stdin")
+
+    def put_body(self):
+        puts = [c for c in self.calls if c[0] == "PUT"]
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0][1], f"/workspaces/{WS}/time-entries/{ENTRY}")
+        return json.loads(puts[0][2])
+
+    def test_update_description_keeps_everything_else(self):
+        out = self.run_stdin("update", {"id": ENTRY, "description": "New\nsecond line"})
+        self.assertTrue(out["ok"], out)
+        self.assertIn("running", out)
+        self.assertEqual(self.put_body(), {
+            "start": "2026-01-01T09:00:07Z", "end": "2026-01-01T10:30:00Z",
+            "description": "New\nsecond line", "billable": True, "projectId": PROJECT, "taskId": TASK,
+            "tagIds": [TAG], "type": "REGULAR",
+            "customFields": [{"customFieldId": FIELD, "value": "T-1", "sourceType": "TIMEENTRY"}],
+        })
+
+    def test_update_project_and_times(self):
+        other = "d" * 24
+        out = self.run_stdin("update", {"id": ENTRY, "projectId": other,
+                                        "start": "2026-01-01T08:00:00Z", "end": "2026-01-01T09:15:00Z"})
+        self.assertTrue(out["ok"], out)
+        body = self.put_body()
+        self.assertEqual((body["start"], body["end"], body["projectId"]),
+                         ("2026-01-01T08:00:00Z", "2026-01-01T09:15:00Z", other))
+        self.assertNotIn("taskId", body)  # the task belonged to the old project
+        self.assertEqual(body["description"], "Old")
+
+    def test_update_can_clear_project(self):
+        self.run_stdin("update", {"id": ENTRY, "projectId": ""})
+        self.assertNotIn("projectId", self.put_body())
+
+    def test_update_running_entry_keeps_it_running(self):
+        self.entry["timeInterval"] = {"start": "2026-01-01T09:00:00Z", "end": None}
+        out = self.run_stdin("update", {"id": ENTRY, "start": "2026-01-01T08:30:00Z"})
+        self.assertTrue(out["ok"], out)
+        body = self.put_body()
+        self.assertEqual(body["start"], "2026-01-01T08:30:00Z")
+        self.assertNotIn("end", body)
+        out = self.run_stdin("update", {"id": ENTRY, "end": "2026-01-01T10:00:00Z"})
+        self.assertEqual(out["kind"], "input")
+
+    def test_update_rejects_bad_times(self):
+        cases = [
+            ({"start": "2026-01-01 08:00"}, "Invalid time"),
+            ({"end": "2026-01-01T08:00:00Z"}, "The end must be after the start"),
+            ({"start": "2026-01-01T11:00:00Z"}, "The end must be after the start"),
+            ({"end": "2999-01-01T00:00:00Z"}, "The end cannot be in the future"),
+        ]
+        for change, error in cases:
+            out = self.run_stdin("update", dict(change, id=ENTRY))
+            self.assertEqual((out["kind"], out["error"]), ("input", error), change)
+        self.assertFalse([c for c in self.calls if c[0] == "PUT"])
+
+    def test_update_enforces_workspace_rules(self):
+        self.settings = {"forceProjects": True, "forceDescription": True}
+        out = self.run_stdin("update", {"id": ENTRY, "projectId": ""})
+        self.assertEqual(out["error"], "This workspace requires a project")
+        out = self.run_stdin("update", {"id": ENTRY, "description": "  \n "})
+        self.assertEqual(out["error"], "This workspace requires a description")
+        self.assertFalse([c for c in self.calls if c[0] == "PUT"])
+
+    def test_update_and_delete_refuse_other_peoples_entries(self):
+        original = dict(self.entry)
+        for change in ({"userId": "9" * 24}, {"workspaceId": "9" * 24}, {"isLocked": True}):
+            self.entry = dict(original, **change)
+            for command in ("update", "delete"):
+                out = self.run_stdin(command, {"id": ENTRY, "description": "x"})
+                self.assertEqual(out["kind"], "input", (command, change))
+        self.entry = None
+        out = self.run_stdin("delete", {"id": ENTRY})
+        self.assertEqual(out["error"], "That entry no longer exists")
+        out = self.run_stdin("delete", {"id": "../" + ENTRY})
+        self.assertEqual(out["error"], "Invalid entry id")
+        self.assertFalse([c for c in self.calls if c[0] in ("PUT", "DELETE")])
+
+    def test_delete(self):
+        out = self.run_stdin("delete", {"id": ENTRY})
+        self.assertTrue(out["ok"], out)
+        self.assertIn(("DELETE", f"/workspaces/{WS}/time-entries/{ENTRY}", None), self.calls)
+
+    def test_update_stdin_rejects_wrong_types(self):
+        out = self.run_stdin("update", {"id": ENTRY, "description": 5})
+        self.assertEqual(out["kind"], "input")
+
+    def test_full_status_includes_history(self):
+        self.recent = [{"id": ENTRY, "description": "A", "projectId": PROJECT,
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}] * 2
+        out = self.run_cmd("status")
+        self.assertEqual(len(out["history"]), 2)
+        self.assertEqual(out["history"][0]["project"]["name"], "P")
+        self.assertTrue(out["historyComplete"])
+        history = [p for _, p, _ in self.calls if "start=" in p]
+        self.assertEqual(len(history), 1)
+        self.assertEqual(self.run_cmd("cached")["history"], out["history"])
+
+    def test_cached_ignores_snapshot_of_older_shape(self):
+        self.run_cmd("status")
+        state = clockify.cache_read("state.json")
+        self.assertTrue(self.run_cmd("cached")["historyComplete"])
+        state.pop("schema")
+        clockify.cache_write("state.json", state)
+        self.assertTrue(self.run_cmd("cached").get("empty"))
+
+    def test_update_skips_unset_custom_fields(self):
+        self.entry["customFieldValues"].append({"customFieldId": "3" * 24, "type": "WORKSPACE", "value": None})
+        self.run_stdin("update", {"id": ENTRY, "description": "x"})
+        self.assertEqual([f["customFieldId"] for f in self.put_body()["customFields"]], [FIELD])
+
+    def test_entry_without_workspace_is_refused(self):
+        self.entry.pop("workspaceId")
+        out = self.run_stdin("update", {"id": ENTRY, "description": "x"})
+        self.assertEqual(out["error"], "That entry is not yours")
 
     def test_internal_errors_are_opaque(self):
         def boom(c):

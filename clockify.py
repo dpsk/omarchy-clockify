@@ -12,6 +12,9 @@ Commands:
   start --stdin              same, reading {"description", "projectId"} from one
                              stdin line so the text never appears in argv
   stop                       stop the running entry (no-op when none)
+  update --stdin             edit one of your entries; reads {"id"} plus any of
+                             "description", "projectId", "start", "end"
+  delete --stdin             delete one of your entries; reads {"id"}
   setup                      interactive: store and verify an API key
 """
 
@@ -29,7 +32,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 # Fixed allowlist: the key header is only ever sent to one of these hosts.
 REGIONS = {
@@ -46,12 +49,19 @@ MAX_DESCRIPTION = 3000
 PROJECTS_TTL_SEC = 3600
 RECENT_FETCH = 30
 RECENT_LIMIT = 8
-USER_AGENT = "omarchy-clockify/1.2.0"
+HISTORY_DAYS = 7
+HISTORY_FETCH = 100
+CLOCK_SKEW_SEC = 60
+# Bumped when the snapshot's shape changes, so an older one is not shown.
+STATE_SCHEMA = 2
+USER_AGENT = "omarchy-clockify/1.3.0"
 MAX_STDIN = 16 * 1024
 
 ID_RE = re.compile(r"^[0-9a-f]{24}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9+/=_-]{16,128}$")
+TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+CUSTOM_FIELD_SOURCES = ("WORKSPACE", "PROJECT", "TIMEENTRY")
 
 
 class ClockifyError(Exception):
@@ -275,6 +285,34 @@ def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def parse_iso(value):
+    """A UTC timestamp in the exact form Clockify takes, or None."""
+    if not isinstance(value, str) or not TIME_RE.match(value):
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def parse_clockify_time(value):
+    """Clockify's own timestamps (which may carry fractions), or None."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else None
+
+
+def history_since():
+    """Local midnight HISTORY_DAYS - 1 days ago, in UTC: today plus six full days."""
+    day = date.today() - timedelta(days=HISTORY_DAYS - 1)
+    # mktime resolves that midnight's own UTC offset, so a DST change inside
+    # the window does not shift it by an hour.
+    start = time.mktime((day.year, day.month, day.day, 0, 0, 0, 0, 0, -1))
+    return datetime.fromtimestamp(start, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def clean_text(value, limit=MAX_DESCRIPTION):
     """Drop control/format characters and collapse whitespace."""
     if not isinstance(value, str):
@@ -287,6 +325,24 @@ def clean_text(value, limit=MAX_DESCRIPTION):
         else:
             kept.append(ch)
     return " ".join("".join(kept).split())[:limit]
+
+
+def clean_description(value, limit=MAX_DESCRIPTION):
+    """Like clean_text, but keeps line breaks: descriptions may be multi-line.
+
+    Other control and format characters are dropped, runs of spaces inside a
+    line collapse, and blank lines are kept to at most one in a row.
+    """
+    if not isinstance(value, str):
+        return ""
+    lines = []
+    for raw in value.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = clean_text(raw, limit)
+        if line or (lines and lines[-1]):
+            lines.append(line)
+    while lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)[:limit].rstrip()
 
 
 def safe_id(value):
@@ -320,13 +376,15 @@ def entry_view(entry):
         return None
     project = project_view(entry.get("project")) if isinstance(entry.get("project"), dict) else None
     project_id = safe_id(entry.get("projectId"))
+    end = interval.get("end") if isinstance(interval, dict) else None
     return {
         "id": safe_id(entry.get("id")),
-        "description": clean_text(entry.get("description")),
+        "description": clean_description(entry.get("description")),
         "projectId": project_id,
         "project": project if project and project["id"] == project_id else None,
         "start": start,
-        "_open": isinstance(interval, dict) and not interval.get("end"),
+        "end": end if isinstance(end, str) and len(end) <= 40 else "",
+        "_open": not end,
     }
 
 
@@ -355,6 +413,18 @@ def recent_view(entries):
         out.append(entry)
         if len(out) >= RECENT_LIMIT:
             break
+    return out
+
+
+def history_view(entries):
+    """Every finished entry, newest first, without the deduping Recent does:
+    each one is a separate record that can be edited or deleted."""
+    out = []
+    for raw in entries if isinstance(entries, list) else []:
+        entry = entry_view(raw)
+        if not entry or entry.pop("_open") or not entry["id"]:
+            continue
+        out.append(entry)
     return out
 
 
@@ -392,6 +462,7 @@ def running_entry(api, user_id, workspace):
         entry = entry_view(entries[0])
         if entry:
             entry.pop("_open")
+            entry.pop("end")
         return entry
     return None
 
@@ -460,25 +531,31 @@ def cmd_status(api, config, light):
 
     # Every call is a full round trip to Clockify, so issue them together:
     # the wait is the slowest request instead of the sum of all of them.
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    entries = f"/workspaces/{workspace}/user/{user_id}/time-entries"
+    with ThreadPoolExecutor(max_workers=5) as pool:
         running_f = pool.submit(running_entry, api, user_id, workspace)
-        recent_f = pool.submit(
-            api.request, "GET", f"/workspaces/{workspace}/user/{user_id}/time-entries?page-size={RECENT_FETCH}"
-        )
+        recent_f = pool.submit(api.request, "GET", f"{entries}?page-size={RECENT_FETCH}")
+        history_f = pool.submit(api.request, "GET", f"{entries}?page-size={HISTORY_FETCH}&start={history_since()}")
         projects_f = pool.submit(projects, api, workspace)
         rules_f = pool.submit(workspace_rules, api, workspace)
-        running, recent_raw = running_f.result(), recent_f.result()
+        running, recent_raw, history_raw = running_f.result(), recent_f.result(), history_f.result()
         project_list, rules = projects_f.result(), rules_f.result()
 
     recent = recent_view(recent_raw)
+    history = history_view(history_raw)
     known = {p["id"] for p in project_list} | known_missing_projects(workspace)
-    unknown = {e["projectId"] for e in recent if e["projectId"] and e["projectId"] not in known}
+    unknown = {e["projectId"] for e in recent + history if e["projectId"] and e["projectId"] not in known}
     if unknown:  # a project newer than the cache; refetch once, then remember
         project_list = projects(api, workspace, fresh=True, missing=unknown)
     attach_projects(recent, project_list)
+    attach_projects(history, project_list)
 
-    result = {"ok": True, "running": running, "recent": recent, "projects": project_list, "rules": rules}
-    cache_write("state.json", dict(result, configMtime=config["mtime"], savedAt=int(time.time())))
+    result = {
+        "ok": True, "running": running, "recent": recent, "history": history,
+        "historyComplete": isinstance(history_raw, list) and len(history_raw) < HISTORY_FETCH,
+        "projects": project_list, "rules": rules,
+    }
+    cache_write("state.json", dict(result, schema=STATE_SCHEMA, configMtime=config["mtime"], savedAt=int(time.time())))
     return result
 
 
@@ -490,17 +567,21 @@ def cmd_cached(config):
     claim a timer that is no longer running.
     """
     state = cache_read("state.json")
-    if not isinstance(state, dict) or state.get("configMtime") != config["mtime"]:
+    if (
+        not isinstance(state, dict)
+        or state.get("configMtime") != config["mtime"]
+        or state.get("schema") != STATE_SCHEMA
+    ):
         return {"ok": True, "empty": True}
-    out = {"ok": True, "cached": True, "savedAt": state.get("savedAt")}
-    for key, kind in (("recent", list), ("projects", list), ("rules", dict)):
+    out = {"ok": True, "cached": True, "savedAt": state.get("savedAt"), "historyComplete": state.get("historyComplete") is not False}
+    for key, kind in (("recent", list), ("history", list), ("projects", list), ("rules", dict)):
         if isinstance(state.get(key), kind):
             out[key] = state[key]
     return out
 
 
 def cmd_start(api, config, description, project_id):
-    description = clean_text(description)
+    description = clean_description(description)
     if project_id and not ID_RE.match(project_id):
         raise ClockifyError("input", "Invalid project id")
     user_id, workspace = session(config, api)
@@ -522,6 +603,7 @@ def cmd_start(api, config, description, project_id):
     entry = entry_view(created)
     if entry:
         entry.pop("_open")
+        entry.pop("end")
     if entry and entry["projectId"] and not entry["project"]:
         for project in projects(api, workspace):
             if project["id"] == entry["projectId"]:
@@ -534,6 +616,112 @@ def cmd_stop(api, config):
     user_id, workspace = session(config, api)
     api.request("PATCH", f"/workspaces/{workspace}/user/{user_id}/time-entries", {"end": now_iso()}, allow_404=True)
     return {"ok": True, "running": None}
+
+
+def own_entry(api, user_id, workspace, entry_id):
+    """Fetch an entry and make sure it is ours. An admin's key can reach
+    other people's entries; this plugin only ever touches the user's own."""
+    if not isinstance(entry_id, str) or not ID_RE.match(entry_id):
+        raise ClockifyError("input", "Invalid entry id")
+    entry = api.request("GET", f"/workspaces/{workspace}/time-entries/{entry_id}", allow_404=True)
+    if not isinstance(entry, dict) or entry.get("id") != entry_id:
+        raise ClockifyError("input", "That entry no longer exists")
+    if entry.get("userId") != user_id or entry.get("workspaceId") != workspace:
+        raise ClockifyError("input", "That entry is not yours")
+    if entry.get("isLocked") is True:
+        raise ClockifyError("input", "That entry is locked")
+    return entry
+
+
+def updated_body(entry, changes, rules, now=None):
+    """The full PUT body for an edited entry.
+
+    Clockify's update replaces the whole entry, so everything the panel does
+    not edit (tags, task, billable, custom fields, type) is carried over from
+    the fetched entry; dropping it would silently clear it.
+    """
+    interval = entry.get("timeInterval") if isinstance(entry.get("timeInterval"), dict) else {}
+    old_start, old_end = interval.get("start"), interval.get("end")
+    running = not old_end
+    now = now or datetime.now(timezone.utc)
+
+    if "description" in changes:
+        description = clean_description(changes["description"])
+    else:
+        description = entry.get("description") if isinstance(entry.get("description"), str) else ""
+    if "projectId" in changes:
+        project_id = changes["projectId"] or ""
+        if project_id and not ID_RE.match(project_id):
+            raise ClockifyError("input", "Invalid project id")
+    else:
+        project_id = safe_id(entry.get("projectId"))
+
+    if running and "end" in changes:
+        raise ClockifyError("input", "Stop the timer to give it an end time")
+    # Times the panel did not change go back exactly as Clockify sent them
+    # (seconds included); edited ones must be in the strict UTC form.
+    times = {}
+    for name, old in (("start", old_start), ("end", old_end)):
+        if name in changes:
+            value = parse_iso(changes[name])
+            if value is None:
+                raise ClockifyError("input", "Invalid time")
+            if value.timestamp() > now.timestamp() + CLOCK_SKEW_SEC:
+                raise ClockifyError("input", f"The {name} cannot be in the future")
+            times[name] = (changes[name], value)
+        elif isinstance(old, str) and old:
+            times[name] = (old, parse_clockify_time(old))
+    if "start" not in times or (not running and "end" not in times):
+        raise ClockifyError("input", "Invalid time")
+    start_s, start = times["start"]
+    end_s, end = times.get("end", (None, None))
+    if start and end and end <= start:
+        raise ClockifyError("input", "The end must be after the start")
+
+    if rules["projectRequired"] and not project_id:
+        raise ClockifyError("input", "This workspace requires a project")
+    if rules["descriptionRequired"] and not description.strip():
+        raise ClockifyError("input", "This workspace requires a description")
+
+    body = {"start": start_s, "description": description, "billable": entry.get("billable") is True}
+    if not running:
+        body["end"] = end_s
+    if project_id:
+        body["projectId"] = project_id
+        # A task belongs to its project; keep it only if the project stays.
+        task_id = safe_id(entry.get("taskId"))
+        if task_id and project_id == safe_id(entry.get("projectId")):
+            body["taskId"] = task_id
+    tags = entry.get("tagIds")
+    if isinstance(tags, list):
+        body["tagIds"] = [t for t in tags if safe_id(t)]
+    if entry.get("type") in ("REGULAR", "BREAK"):
+        body["type"] = entry["type"]
+    fields = []
+    for item in entry.get("customFieldValues") or []:
+        if isinstance(item, dict) and safe_id(item.get("customFieldId")) and item.get("value") is not None:
+            field = {"customFieldId": item["customFieldId"], "value": item.get("value")}
+            if item.get("type") in CUSTOM_FIELD_SOURCES:
+                field["sourceType"] = item["type"]
+            fields.append(field)
+    if fields:
+        body["customFields"] = fields
+    return body
+
+
+def cmd_update(api, config, changes):
+    user_id, workspace = session(config, api)
+    entry = own_entry(api, user_id, workspace, changes.get("id"))
+    body = updated_body(entry, changes, workspace_rules(api, workspace))
+    api.request("PUT", f"/workspaces/{workspace}/time-entries/{entry['id']}", body)
+    return {"ok": True, "running": running_entry(api, user_id, workspace)}
+
+
+def cmd_delete(api, config, entry_id):
+    user_id, workspace = session(config, api)
+    entry = own_entry(api, user_id, workspace, entry_id)
+    api.request("DELETE", f"/workspaces/{workspace}/time-entries/{entry['id']}")
+    return {"ok": True, "running": running_entry(api, user_id, workspace)}
 
 
 def cmd_setup():
@@ -582,7 +770,7 @@ def cmd_setup():
     return 0
 
 
-def read_start_stdin(stream=None):
+def read_stdin_json(stream=None):
     stream = stream or sys.stdin
     line = stream.readline(MAX_STDIN + 1)
     if len(line) > MAX_STDIN:
@@ -593,6 +781,11 @@ def read_start_stdin(stream=None):
         raise ClockifyError("input", "Malformed input")
     if not isinstance(data, dict):
         raise ClockifyError("input", "Malformed input")
+    return data
+
+
+def read_start_stdin(stream=None):
+    data = read_stdin_json(stream)
     description = data.get("description")
     project_id = data.get("projectId") or ""
     if not isinstance(description, str) or not isinstance(project_id, str):
@@ -600,9 +793,20 @@ def read_start_stdin(stream=None):
     return description, project_id
 
 
+def read_update_stdin(stream=None):
+    data = read_stdin_json(stream)
+    changes = {"id": data.get("id")}
+    for key in ("description", "projectId", "start", "end"):
+        if key in data:
+            if not isinstance(data[key], str):
+                raise ClockifyError("input", "Malformed input")
+            changes[key] = data[key]
+    return changes
+
+
 def run(argv, config_loader=load_config, api_factory=Api):
     if not argv or argv[0] in ("-h", "--help"):
-        return {"ok": False, "kind": "usage", "error": "usage: clockify.py status|cached|start|stop|setup"}
+        return {"ok": False, "kind": "usage", "error": "usage: clockify.py status|cached|start|stop|update|delete|setup"}
     command, args = argv[0], argv[1:]
     try:
         config = config_loader()
@@ -620,6 +824,10 @@ def run(argv, config_loader=load_config, api_factory=Api):
             return cmd_start(api, config, args[0], args[1] if len(args) > 1 else "")
         if command == "stop":
             return cmd_stop(api, config)
+        if command == "update" and args == ["--stdin"]:
+            return cmd_update(api, config, read_update_stdin())
+        if command == "delete" and args == ["--stdin"]:
+            return cmd_delete(api, config, read_stdin_json().get("id"))
         raise ClockifyError("usage", f"Unknown command: {clean_text(command, 40)}")
     except ClockifyError as e:
         return {"ok": False, "kind": e.kind, "error": e.message}
