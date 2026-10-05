@@ -12,6 +12,8 @@ That's the whole app. It's a native Omarchy shell plugin, so it follows your
 theme and fonts. It keeps no daemon running and has no dependencies beyond
 Python's standard library.
 
+<img src="screenshot.png" alt="Clockify panel open under the Omarchy bar, showing a running timer and recent entries" width="420">
+
 ## Install
 
 ```bash
