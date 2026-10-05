@@ -189,6 +189,8 @@ class CommandTests(TempHome):
         self.write_config({"apiKey": KEY})
         self.calls = []
         self.settings = {}
+        self.recent = []
+        self.projects_payload = [{"id": PROJECT, "name": "P", "color": "#ff0000"}]
 
     def handler(self, req):
         self.calls.append((req.get_method(), req.full_url.split("/api/v1", 1)[1], req.data))
@@ -202,13 +204,15 @@ class CommandTests(TempHome):
         if path == f"/workspaces/{WS}":
             return {"id": WS, "workspaceSettings": self.settings}
         if "/projects" in path:
-            return [{"id": PROJECT, "name": "P", "color": "#ff0000"}]
+            return self.projects_payload
         if req.get_method() == "PATCH":
             return http_error(404)
         if req.get_method() == "POST":
             body = json.loads(req.data)
             return {"id": USER, "description": body["description"], "projectId": body.get("projectId"),
                     "timeInterval": {"start": body["start"]}}
+        if "/time-entries" in path:
+            return self.recent
         return []
 
     def run_cmd(self, *argv):
@@ -235,6 +239,48 @@ class CommandTests(TempHome):
         self.assertEqual(methods, ["PATCH", "POST"])
         self.assertEqual(out["running"]["description"], "Write code")
         self.assertEqual(out["running"]["project"]["name"], "P")
+
+    def test_full_status_fetches_in_parallel_and_attaches_projects(self):
+        self.recent = [{"id": USER, "description": "Docs", "projectId": PROJECT,
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z"}}]
+        self.run_cmd("status")  # warm the session cache
+        self.calls.clear()
+        out = self.run_cmd("status")
+        paths = sorted(p.split("?")[0] for _, p, _ in self.calls)
+        self.assertEqual(len(paths), 2)  # running + recent; projects and rules are cached
+        self.assertEqual(out["recent"][0]["project"]["name"], "P")
+
+    def test_unknown_project_refetches_projects_once(self):
+        self.run_cmd("status")  # caches projects without NEW
+        new = "d" * 24
+        self.projects_payload = [{"id": PROJECT, "name": "P"}, {"id": new, "name": "New one"}]
+        self.recent = [{"id": USER, "description": "x", "projectId": new,
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z"}}]
+        self.calls.clear()
+        out = self.run_cmd("status")
+        self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 1)
+        self.assertEqual(out["recent"][0]["project"]["name"], "New one")
+
+    def test_cached_returns_snapshot_without_network(self):
+        self.assertTrue(self.run_cmd("cached").get("empty"))
+        self.run_cmd("status")
+        self.calls.clear()
+        out = self.run_cmd("cached")
+        self.assertEqual(self.calls, [])
+        self.assertTrue(out["cached"])
+        self.assertEqual(out["projects"][0]["id"], PROJECT)
+        self.assertNotIn("running", out)  # never claim a possibly stale timer
+        state = os.path.join(clockify.cache_dir(), "state.json")
+        self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+        with open(state) as f:
+            self.assertNotIn(KEY, f.read())
+
+    def test_cached_ignores_snapshot_from_other_config(self):
+        self.run_cmd("status")
+        path = clockify.config_path()
+        st = os.stat(path)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # key or account changed
+        self.assertTrue(self.run_cmd("cached").get("empty"))
 
     def test_start_rejects_bad_project(self):
         out = self.run_cmd("start", "x", "1; rm -rf /")

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "dpsk.clockify",
   "name": "Clockify",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "dpsk",
   "license": "MIT",
   "description": "Minimal Clockify time tracker in the Omarchy bar: start, stop, and restart timers.",

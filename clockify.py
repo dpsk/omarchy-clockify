@@ -7,6 +7,7 @@ must be private to the current user.
 
 Commands:
   status [--light]           running entry; full mode adds projects and recents
+  cached                     last full status from disk, no network
   start <description> [pid]  stop whatever runs, then start a new entry
   stop                       stop the running entry (no-op when none)
   setup                      interactive: store and verify an API key
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -37,8 +39,8 @@ REGIONS = {
 TIMEOUT_SEC = 10
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_DESCRIPTION = 3000
-PROJECTS_TTL_SEC = 600
-RECENT_FETCH = 50
+PROJECTS_TTL_SEC = 3600
+RECENT_FETCH = 30
 RECENT_LIMIT = 8
 USER_AGENT = "omarchy-clockify/1.0"
 
@@ -118,25 +120,23 @@ def write_private_json(path, data):
     """Atomically write JSON readable only by the current user."""
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
-    old_umask = os.umask(0o077)
+    # mkstemp creates the file 0600; no umask juggling, which would not be
+    # thread-safe now that status fetches in parallel.
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".clockify.", suffix=".json.tmp")
     try:
-        fd, tmp = tempfile.mkstemp(dir=directory, prefix=".clockify.", suffix=".json.tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-    finally:
-        os.umask(old_umask)
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------- cache
@@ -291,6 +291,15 @@ def entry_view(entry):
     }
 
 
+def attach_projects(entries, project_list):
+    """Fill in project details from the project list (recents are fetched unhydrated)."""
+    by_id = {p["id"]: p for p in project_list}
+    for entry in entries:
+        if entry and entry["projectId"] and not entry["project"]:
+            entry["project"] = by_id.get(entry["projectId"])
+    return entries
+
+
 def recent_view(entries):
     seen = set()
     out = []
@@ -343,8 +352,8 @@ def running_entry(api, user_id, workspace):
     return None
 
 
-def projects(api, workspace):
-    cached = cache_read("projects.json", PROJECTS_TTL_SEC)
+def projects(api, workspace, fresh=False):
+    cached = None if fresh else cache_read("projects.json", PROJECTS_TTL_SEC)
     if isinstance(cached, dict) and cached.get("workspaceId") == workspace and isinstance(cached.get("projects"), list):
         return cached["projects"]
     raw = api.request("GET", f"/workspaces/{workspace}/projects?archived=false&page-size=500&sort-column=NAME")
@@ -374,16 +383,47 @@ def workspace_rules(api, workspace):
 
 def cmd_status(api, config, light):
     user_id, workspace = session(config, api)
-    result = {"ok": True, "running": running_entry(api, user_id, workspace)}
-    if not light:
-        result["projects"] = projects(api, workspace)
-        result["rules"] = workspace_rules(api, workspace)
-        recent = api.request(
-            "GET",
-            f"/workspaces/{workspace}/user/{user_id}/time-entries?hydrated=true&page-size={RECENT_FETCH}",
+    if light:
+        return {"ok": True, "running": running_entry(api, user_id, workspace)}
+
+    # Every call is a full round trip to Clockify, so issue them together:
+    # the wait is the slowest request instead of the sum of all of them.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        running_f = pool.submit(running_entry, api, user_id, workspace)
+        recent_f = pool.submit(
+            api.request, "GET", f"/workspaces/{workspace}/user/{user_id}/time-entries?page-size={RECENT_FETCH}"
         )
-        result["recent"] = recent_view(recent)
+        projects_f = pool.submit(projects, api, workspace)
+        rules_f = pool.submit(workspace_rules, api, workspace)
+        running, recent_raw = running_f.result(), recent_f.result()
+        project_list, rules = projects_f.result(), rules_f.result()
+
+    recent = recent_view(recent_raw)
+    known = {p["id"] for p in project_list}
+    if any(e["projectId"] and e["projectId"] not in known for e in recent):
+        project_list = projects(api, workspace, fresh=True)  # a project newer than the cache
+    attach_projects(recent, project_list)
+
+    result = {"ok": True, "running": running, "recent": recent, "projects": project_list, "rules": rules}
+    cache_write("state.json", dict(result, configMtime=config["mtime"], savedAt=int(time.time())))
     return result
+
+
+def cmd_cached(config):
+    """The last full status, without touching the network.
+
+    Tied to the config revision so another account's data is never shown.
+    The running entry is left out: it may be stale, and the bar must not
+    claim a timer that is no longer running.
+    """
+    state = cache_read("state.json")
+    if not isinstance(state, dict) or state.get("configMtime") != config["mtime"]:
+        return {"ok": True, "empty": True}
+    out = {"ok": True, "cached": True, "savedAt": state.get("savedAt")}
+    for key, kind in (("recent", list), ("projects", list), ("rules", dict)):
+        if isinstance(state.get(key), kind):
+            out[key] = state[key]
+    return out
 
 
 def cmd_start(api, config, description, project_id):
@@ -469,10 +509,12 @@ def cmd_setup():
 
 def run(argv, config_loader=load_config, api_factory=Api):
     if not argv or argv[0] in ("-h", "--help"):
-        return {"ok": False, "kind": "usage", "error": "usage: clockify.py status|start|stop|setup"}
+        return {"ok": False, "kind": "usage", "error": "usage: clockify.py status|cached|start|stop|setup"}
     command, args = argv[0], argv[1:]
     try:
         config = config_loader()
+        if command == "cached":
+            return cmd_cached(config)
         api = api_factory(config)
         if command == "status":
             return cmd_status(api, config, light="--light" in args)

@@ -38,7 +38,18 @@ Panel {
   property var pendingArgs: null
   property bool pendingIsAction: false
   property bool actionInFlight: false
+  // What the running helper was asked for ("cached", "light", "full",
+  // "action"). Kept until the next launch because stdout and exit can
+  // arrive in either order.
+  property string currentKind: ""
   readonly property bool busy: actionInFlight || (pendingArgs !== null && pendingIsAction)
+
+  // Background prefetch: recents and projects are refreshed when something
+  // changed, not when the popup opens, so opening never waits on Clockify.
+  property bool fullWanted: true
+  property double lastFullMs: 0
+  property string lastRunningId: ""
+  readonly property int staleAfterMs: 60000
 
   // New-entry form state.
   property string draftDescription: ""
@@ -98,11 +109,40 @@ Panel {
       return
     }
     actionInFlight = isAction
+    currentKind = isAction ? "action" : (args[0] === "cached" ? "cached" : (args.indexOf("--light") >= 0 ? "light" : "full"))
     helperProc.command = ["python3", root.helperPath].concat(args)
     helperProc.running = true
   }
 
-  function refresh() { request(opened ? ["status"] : ["status", "--light"], false) }
+  function refresh() { request(fullWanted ? ["status"] : ["status", "--light"], false) }
+
+  function wantFull() {
+    fullWanted = true
+    Qt.callLater(root.refreshIfIdle)
+  }
+
+  // Runs queued background work once the helper is free. Called after every
+  // exit and after output is handled, whichever comes last.
+  function refreshIfIdle() {
+    if (helperProc.running) return
+    if (pendingArgs !== null) {
+      var args = pendingArgs
+      var isAction = pendingIsAction
+      pendingArgs = null
+      pendingIsAction = false
+      request(args, isAction)
+    } else if (fullWanted) {
+      refresh()
+    }
+  }
+
+  // The disk snapshot only fills the lists; whether a timer is running is
+  // always confirmed live before the bar shows one.
+  function applyCached(data) {
+    if (Array.isArray(data.projects)) projects = data.projects
+    if (Array.isArray(data.recent)) recent = data.recent
+    if (data.rules && typeof data.rules === "object") rules = data.rules
+  }
 
   function startEntry(description, projectId) {
     if (busy) return
@@ -132,8 +172,10 @@ Panel {
   function handleOutput(text) {
     var data = null
     try { data = JSON.parse(text) } catch (e) { data = null }
+    var kind0 = currentKind
+    var wasAction = kind0 === "action"
     if (!data || typeof data !== "object") {
-      if (actionInFlight) actionError = "Helper returned no data"
+      if (wasAction) actionError = "Helper returned no data"
       else fail("internal", "Helper returned no data")
       return
     }
@@ -141,8 +183,12 @@ Panel {
       var message = String(data.error || "Unknown error")
       var kind = String(data.kind || "internal")
       // Rejected input is about this action, not about connectivity.
-      if (actionInFlight && (kind === "rejected" || kind === "input")) actionError = message
+      if (wasAction && (kind === "rejected" || kind === "input")) actionError = message
       else fail(kind, message)
+      return
+    }
+    if (kind0 === "cached") {
+      applyCached(data)
       return
     }
     error = ""
@@ -150,16 +196,22 @@ Panel {
     failures = 0
     loaded = true
     running = data.running || null
-    if (Array.isArray(data.projects)) projects = data.projects
-    if (Array.isArray(data.recent)) recent = data.recent
-    if (data.rules && typeof data.rules === "object") rules = data.rules
-    if (actionInFlight) {
+    applyCached(data)
+    if (kind0 === "full") {
+      fullWanted = false
+      lastFullMs = Date.now()
+    }
+    var runningId = running ? String(running.id || "") : ""
+    // A timer started or stopped elsewhere changes Recent; fetch it now,
+    // in the background, rather than when the popup is next opened.
+    if (kind0 === "light" && runningId !== lastRunningId) wantFull()
+    lastRunningId = runningId
+    if (wasAction) {
       draftDescription = ""
       draftProjectId = ""
       recentIndex = -1
       pickerOpen = false
-      // Recents changed; pick them up if the panel is still showing.
-      if (opened) Qt.callLater(function() { root.request(["status"], false) })
+      wantFull()
     }
   }
 
@@ -199,13 +251,7 @@ Panel {
     }
     onExited: function(code) {
       root.actionInFlight = false
-      if (root.pendingArgs !== null) {
-        var args = root.pendingArgs
-        var isAction = root.pendingIsAction
-        root.pendingArgs = null
-        root.pendingIsAction = false
-        Qt.callLater(function() { root.request(args, isAction) })
-      }
+      Qt.callLater(root.refreshIfIdle)
     }
   }
 
@@ -214,7 +260,6 @@ Panel {
     interval: root.pollIntervalMs()
     running: true
     repeat: true
-    triggeredOnStart: true
     onTriggered: root.refresh()
   }
 
@@ -236,9 +281,15 @@ Panel {
       actionError = ""
       recentIndex = -1
       pickerOpen = false
-      refresh()
+      // Show what we have immediately; revalidate in the background only
+      // when it is getting old.
+      if (Date.now() - lastFullMs > staleAfterMs) wantFull()
     }
   }
+
+  // Startup: the disk snapshot fills the lists in ~40 ms, then a live full
+  // status follows (fullWanted starts true), all before the first open.
+  Component.onCompleted: request(["cached"], false)
 
   IpcHandler {
     target: root.ipcTarget
@@ -247,7 +298,7 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { root.refresh(); return "ok" }
+    function refresh(): string { root.wantFull(); return "ok" }
     function stop(): string { root.stopEntry(); return "ok" }
     function status(): string { return root.tracking ? root.elapsedText(false) + " " + root.entryLabel(root.running) : "idle" }
   }
@@ -303,7 +354,7 @@ Panel {
       blocked: descField.activeFocus || filterField.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r") root.refresh() }
+      onTextKey: function(t) { if (t === "r") root.wantFull() }
 
       Column {
         id: column
