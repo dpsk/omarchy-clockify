@@ -1,0 +1,6 @@
+# Never commit credentials or local state.
+clockify.json
+*.json.tmp
+__pycache__/
+*.pyc
+.env

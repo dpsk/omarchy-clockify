@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m py_compile clockify.py
+      - run: python -m unittest discover -v tests
+      - name: Manifest is valid JSON
+        run: python -c "import json; m = json.load(open('manifest.json')); assert m['id'] == 'dpsk.clockify'"
