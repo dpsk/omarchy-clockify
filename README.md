@@ -67,6 +67,7 @@ The helper also works as a standalone CLI. It prints JSON:
 
 ```bash
 clockify.py status [--light]
+clockify.py cached            # last snapshot from disk, no network
 clockify.py start "Writing docs" [projectId]
 clockify.py stop
 ```
@@ -90,18 +91,24 @@ omarchy bar set dpsk.clockify refreshIntervalSec 60 --json
 
 ## Resource use
 
-- While the popup is closed, the bar does one small HTTP request every
-  `refreshIntervalSec`, through a short-lived Python process that exits right
-  away. This keeps timers you start on other devices in sync. After errors,
-  polling backs off up to 5 minutes.
+- **Opening is instant.** The popup draws whatever is already in memory and
+  never waits on the network. At startup, the last snapshot is read from disk
+  (~40 ms), so Recent and projects are ready even right after login.
+- **Refreshing happens in the background.** While the popup is closed, the bar
+  makes one small request every `refreshIntervalSec` through a short-lived
+  Python process that exits right away. A full refresh (recent entries,
+  projects, workspace rules) runs only when something changed: a timer was
+  started or stopped here or on another device, or the data is more than a
+  minute old when you open the popup. Its requests go out in parallel, so it
+  costs about one round trip to Clockify.
+- After errors, polling backs off up to 5 minutes.
 - The bar label updates once a minute, and only while a timer is running.
 - The popup's contents are created when it opens and destroyed when it closes.
-- Projects are cached for 10 minutes in `~/.cache/omarchy-clockify/`.
 
 ## What this plugin can access
 
 - **Network**: only Clockify's API hosts (`api.clockify.me` or the regional host you choose).
-- **Files**: reads `~/.config/omarchy/clockify.json`, and reads and writes `~/.cache/omarchy-clockify/`.
+- **Files**: reads `~/.config/omarchy/clockify.json`, and reads and writes `~/.cache/omarchy-clockify/` (your recent entries and projects, so the popup opens instantly).
 - **Your Clockify account**: whatever your API key allows. The plugin only
   reads your user, workspaces, projects, and your own time entries, and only
   creates or stops your own time entries.

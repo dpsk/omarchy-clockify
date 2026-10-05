@@ -30,5 +30,9 @@ that the Clockify API key is never part of that scene:
   sanitized in the helper and rendered as plain text in QML, so it cannot
   inject rich text, links, or images.
 
-The cache in `~/.cache/omarchy-clockify/` (mode 700) holds only your user id,
-workspace id, and project names/colors — never the key.
+The cache in `~/.cache/omarchy-clockify/` (directory mode 700, files mode 600)
+holds your user id, workspace id, project names and colors, workspace rules,
+and a snapshot of your recent entries' descriptions, so the panel can open
+without waiting on the network. It never holds the key. The snapshot is tied
+to the config file's revision and is ignored after the key or account
+changes. Delete the directory at any time; it is rebuilt on the next refresh.
