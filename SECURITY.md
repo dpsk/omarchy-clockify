@@ -37,9 +37,11 @@ that the Clockify API key is never part of that scene:
   sanitized in the helper and rendered as plain text in QML, so it cannot
   inject rich text, links, or images.
 
-The cache in `~/.cache/omarchy-clockify/`
-holds your user id, workspace id, project names and colors, workspace rules,
-and a snapshot of your recent entries' descriptions, so the panel can open
-without waiting on the network. It never holds the key. The snapshot is tied
-to the config file's revision and is ignored after the key or account
-changes. Delete the directory at any time; it is rebuilt on the next refresh.
+The cache in `~/.cache/omarchy-clockify/` holds your user id, workspace id,
+project names, colors and client names, workspace rules, and a snapshot of
+your recent entries and the running entry (descriptions, entry ids, start
+times, project ids), so the panel can open without waiting on the network. It
+never holds the key. The snapshot is tied to the config file's modification
+time and is ignored after setup rewrites the config, for example with a new
+key or account. Delete the directory at any time; it is rebuilt on the next
+refresh.
