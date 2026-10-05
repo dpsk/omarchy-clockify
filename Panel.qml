@@ -14,7 +14,10 @@ Panel {
   manageIpc: false
 
   readonly property string helperPath: decodeURIComponent(String(Qt.resolvedUrl("clockify.py")).replace(/^file:\/\//, ""))
-  readonly property int baseIntervalSec: Math.max(10, Number(setting("refreshIntervalSec", 30)) || 30)
+  readonly property int baseIntervalSec: {
+    var n = Number(setting("refreshIntervalSec", 30))
+    return isFinite(n) ? Math.min(3600, Math.max(10, Math.round(n))) : 30
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -37,6 +40,13 @@ Panel {
   // wins the queue slot; a poll only takes it when nothing else is waiting.
   property var pendingArgs: null
   property bool pendingIsAction: false
+  property string pendingPayload: ""
+  // One request to run next even while backing off (a manual refresh, the
+  // check after a failed action). Background refreshes never bypass backoff.
+  property var followUp: null
+  // Output of the last launch has been processed; nothing new is launched
+  // before that, so a result can never be read with the wrong currentKind.
+  property bool outputHandled: true
   property bool actionInFlight: false
   // What the running helper was asked for ("cached", "light", "full",
   // "action"). Kept until the next launch because stdout and exit can
@@ -100,38 +110,57 @@ Panel {
 
   // ---------------------------------------------------------------- helper
 
-  function request(args, isAction) {
-    if (helperProc.running) {
+  function request(args, isAction, payload) {
+    if (helperProc.running || !outputHandled) {
       if (isAction || pendingArgs === null) {
         pendingArgs = args
         pendingIsAction = isAction
+        pendingPayload = payload || ""
       }
       return
     }
     actionInFlight = isAction
+    outputHandled = false
     currentKind = isAction ? "action" : (args[0] === "cached" ? "cached" : (args.indexOf("--light") >= 0 ? "light" : "full"))
+    helperProc.stdinPayload = payload || ""
     helperProc.command = ["python3", root.helperPath].concat(args)
     helperProc.running = true
   }
 
   function refresh() { request(fullWanted ? ["status"] : ["status", "--light"], false) }
 
+  // Background: refresh soon, but only while healthy. When requests are
+  // failing, the poll timer retries with backoff instead.
   function wantFull() {
     fullWanted = true
     Qt.callLater(root.refreshIfIdle)
   }
 
-  // Runs queued background work once the helper is free. Called after every
-  // exit and after output is handled, whichever comes last.
+  // Explicit user request (open with stale data, `r`, IPC refresh): one
+  // attempt right away even during backoff.
+  function refreshNow() {
+    fullWanted = true
+    followUp = ["status"]
+    Qt.callLater(root.refreshIfIdle)
+  }
+
+  // Runs queued work once the helper is free and its output was handled.
+  // Called after both events, so whichever comes last launches the next.
   function refreshIfIdle() {
-    if (helperProc.running) return
+    if (helperProc.running || !outputHandled) return
     if (pendingArgs !== null) {
       var args = pendingArgs
       var isAction = pendingIsAction
+      var payload = pendingPayload
       pendingArgs = null
       pendingIsAction = false
-      request(args, isAction)
-    } else if (fullWanted) {
+      pendingPayload = ""
+      request(args, isAction, payload)
+    } else if (followUp !== null) {
+      var next = followUp
+      followUp = null
+      request(next, false)
+    } else if (fullWanted && failures === 0) {
       refresh()
     }
   }
@@ -149,9 +178,13 @@ Panel {
     var problem = missingFor(description, projectId)
     if (problem) { actionError = problem; return }
     actionError = ""
-    var args = ["start", String(description || "")]
-    if (projectId && /^[0-9a-f]{24}$/.test(projectId)) args.push(projectId)
-    request(args, true)
+    // The description goes over stdin: argv is readable by every local user
+    // through /proc, and entry text can be client-confidential.
+    var payload = JSON.stringify({
+      description: String(description || ""),
+      projectId: projectId && /^[0-9a-f]{24}$/.test(projectId) ? projectId : ""
+    })
+    request(["start", "--stdin"], true, payload + "\n")
   }
 
   function stopEntry() {
@@ -170,21 +203,25 @@ Panel {
   }
 
   function handleOutput(text) {
+    outputHandled = true
+    Qt.callLater(root.refreshIfIdle)
     var data = null
     try { data = JSON.parse(text) } catch (e) { data = null }
     var kind0 = currentKind
     var wasAction = kind0 === "action"
-    if (!data || typeof data !== "object") {
-      if (wasAction) actionError = "Helper returned no data"
-      else fail("internal", "Helper returned no data")
-      return
-    }
-    if (!data.ok) {
-      var message = String(data.error || "Unknown error")
-      var kind = String(data.kind || "internal")
-      // Rejected input is about this action, not about connectivity.
-      if (wasAction && (kind === "rejected" || kind === "input")) actionError = message
-      else fail(kind, message)
+    if (!data || typeof data !== "object" || !data.ok) {
+      var message = data && data.error ? String(data.error) : "Helper returned no data"
+      var kind = data && data.kind ? String(data.kind) : "internal"
+      if (wasAction) {
+        // The action may have half-happened (start stops the running entry
+        // before creating the new one), so re-check what is running now.
+        actionError = message
+        followUp = ["status", "--light"]
+        // Rejected input is about this action, not about connectivity.
+        if (kind !== "rejected" && kind !== "input") fail(kind, message)
+      } else {
+        fail(kind, message)
+      }
       return
     }
     if (kind0 === "cached") {
@@ -241,17 +278,50 @@ Panel {
     var quoted = "'" + root.helperPath.replace(/'/g, "'\\''") + "'"
     Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", "python3 " + quoted + " setup"])
     root.close()
+    setupWatch.remaining = 36
+    setupWatch.restart()
   }
 
   Process {
     id: helperProc
+    property string stdinPayload: ""
+    stdinEnabled: true
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.handleOutput(text)
     }
-    onExited: function(code) {
+    onStarted: {
+      if (stdinPayload !== "") write(stdinPayload)
+      stdinPayload = ""
+    }
+    // Reset here rather than in onExited: a process that fails to start
+    // may never report an exit, and busy must not stick.
+    onRunningChanged: {
+      if (running) return
       root.actionInFlight = false
+      orphanCheck.restart()
       Qt.callLater(root.refreshIfIdle)
+    }
+  }
+
+  // If a run ends without its stdout ever finishing (failed to start),
+  // close it out as an error so the queue keeps moving.
+  Timer {
+    id: orphanCheck
+    interval: 2000
+    onTriggered: if (!root.outputHandled && !helperProc.running) root.handleOutput("")
+  }
+
+  // After launching setup, check every 5 s for a few minutes so the bar
+  // comes alive as soon as the key is saved.
+  Timer {
+    id: setupWatch
+    property int remaining: 0
+    interval: 5000
+    repeat: true
+    onTriggered: {
+      if (!root.needsSetup || --remaining <= 0) { stop(); return }
+      root.refreshNow()
     }
   }
 
@@ -283,7 +353,7 @@ Panel {
       pickerOpen = false
       // Show what we have immediately; revalidate in the background only
       // when it is getting old.
-      if (Date.now() - lastFullMs > staleAfterMs) wantFull()
+      if (Date.now() - lastFullMs > staleAfterMs) refreshNow()
     }
   }
 
@@ -298,8 +368,18 @@ Panel {
     function show(): void { root.open() }
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
-    function refresh(): string { root.wantFull(); return "ok" }
+    function refresh(): string { root.refreshNow(); return "ok" }
     function stop(): string { root.stopEntry(); return "ok" }
+    // Scriptable start, e.g. a hotkey for a recurring task. Workspace rules
+    // apply exactly as in the panel; the result shows up in the bar.
+    function start(description: string, projectId: string): string {
+      if (root.busy) return "busy"
+      var problem = root.missingFor(description, projectId)
+      if (problem) return problem
+      if (projectId && !/^[0-9a-f]{24}$/.test(projectId)) return "invalid project id"
+      root.startEntry(description, projectId)
+      return "ok"
+    }
     function status(): string { return root.tracking ? root.elapsedText(false) + " " + root.entryLabel(root.running) : "idle" }
   }
 
@@ -354,7 +434,7 @@ Panel {
       blocked: descField.activeFocus || filterField.activeFocus
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(t) { if (t === "r") root.wantFull() }
+      onTextKey: function(t) { if (t === "r") root.refreshNow() }
 
       Column {
         id: column
@@ -574,7 +654,9 @@ Panel {
               var out = root.projectRequired ? [] : [{ id: "", name: "No project", color: "" }]
               for (var i = 0; i < root.projects.length && out.length < 60; i++) {
                 var p = root.projects[i]
-                if (!q || p.name.toLowerCase().indexOf(q) >= 0 || (p.client || "").toLowerCase().indexOf(q) >= 0) out.push(p)
+                if (p.archived) continue
+                var name = String(p.name || "")
+                if (!q || name.toLowerCase().indexOf(q) >= 0 || String(p.client || "").toLowerCase().indexOf(q) >= 0) out.push(p)
               }
               return out
             }
@@ -602,7 +684,7 @@ Panel {
                   picker.cursor = Math.min(picker.matches.length - 1, picker.cursor + 1); event.accepted = true
                 } else if (event.key === Qt.Key_Up) {
                   picker.cursor = Math.max(0, picker.cursor - 1); event.accepted = true
-                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Tab) {
                   picker.choose(picker.cursor); event.accepted = true
                 }
               }

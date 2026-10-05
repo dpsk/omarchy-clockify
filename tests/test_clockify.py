@@ -75,6 +75,39 @@ class ConfigTests(TempHome):
         self.assertEqual(config["workspaceId"], WS)
         self.assertEqual(config["region"], "eu")
 
+    def test_symlinked_config_message(self):
+        real = self.write_config({"apiKey": KEY})
+        os.rename(real, real + ".real")
+        os.symlink(real + ".real", real)
+        with self.assertRaises(clockify.ClockifyError) as ctx:
+            clockify.load_config()
+        self.assertIn("not a symlink", ctx.exception.message)
+
+    def test_cache_refuses_symlink_to_config(self):
+        self.write_config({"apiKey": KEY})
+        clockify.cache_write("probe.json", {"x": 1})
+        os.symlink(clockify.config_path(), os.path.join(clockify.cache_dir(), "projects.json"))
+        self.assertIsNone(clockify.cache_read("projects.json"))
+        self.assertEqual(clockify.cache_read("probe.json"), {"x": 1})
+
+    def test_cache_refuses_loose_files_and_symlinked_dir(self):
+        clockify.cache_write("probe.json", {"x": 1})
+        path = os.path.join(clockify.cache_dir(), "probe.json")
+        os.chmod(path, 0o644)
+        self.assertIsNone(clockify.cache_read("probe.json"))
+        os.chmod(path, 0o600)
+        real = clockify.cache_dir() + ".real"
+        os.rename(clockify.cache_dir(), real)
+        os.symlink(real, clockify.cache_dir())
+        self.assertIsNone(clockify.cache_read("probe.json"))
+
+    def test_cache_dir_is_tightened(self):
+        os.makedirs(clockify.cache_dir(), mode=0o755)
+        os.chmod(clockify.cache_dir(), 0o755)
+        clockify.cache_write("probe.json", {"x": 1})
+        self.assertEqual(os.stat(clockify.cache_dir()).st_mode & 0o777, 0o700)
+        self.assertEqual(clockify.cache_read("probe.json"), {"x": 1})
+
     def test_private_write_mode(self):
         path = os.path.join(self.tmp.name, "out", "x.json")
         clockify.write_private_json(path, {"a": 1})
@@ -155,6 +188,13 @@ class ApiTests(unittest.TestCase):
         self.assertTrue(ctx.exception.message.startswith("Project is required<b>"))
         self.assertLessEqual(len(ctx.exception.message), 200)
 
+    def test_truncated_body_is_offline(self):
+        import http.client
+        api, _ = self.api(lambda r: http.client.IncompleteRead(b"partial"))
+        with self.assertRaises(clockify.ClockifyError) as ctx:
+            api.request("GET", "/user")
+        self.assertEqual(ctx.exception.kind, "offline")
+
     def test_404_allowed(self):
         api, _ = self.api(lambda r: http_error(404))
         self.assertIsNone(api.request("PATCH", "/x", {}, allow_404=True))
@@ -178,7 +218,7 @@ class SanitizeTests(unittest.TestCase):
         self.assertEqual(clockify.safe_color("red; x"), "")
 
     def test_recent_dedupes(self):
-        e = lambda d, p: {"id": USER, "description": d, "projectId": p, "timeInterval": {"start": "2026-01-01T00:00:00Z"}}
+        e = lambda d, p: {"id": USER, "description": d, "projectId": p, "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}
         out = clockify.recent_view([e("A", PROJECT), e("a", PROJECT), e("B", ""), e("", ""), "junk"])
         self.assertEqual([x["description"] for x in out], ["A", "B"])
 
@@ -200,7 +240,7 @@ class CommandTests(TempHome):
         if "in-progress=true" in path:
             return [{"id": USER, "description": "Work", "projectId": PROJECT,
                      "project": {"id": PROJECT, "name": "P", "color": "#ff0000"},
-                     "timeInterval": {"start": "2026-01-01T00:00:00Z"}}]
+                     "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}]
         if path == f"/workspaces/{WS}":
             return {"id": WS, "workspaceSettings": self.settings}
         if "/projects" in path:
@@ -242,7 +282,7 @@ class CommandTests(TempHome):
 
     def test_full_status_fetches_in_parallel_and_attaches_projects(self):
         self.recent = [{"id": USER, "description": "Docs", "projectId": PROJECT,
-                        "timeInterval": {"start": "2026-01-01T00:00:00Z"}}]
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}]
         self.run_cmd("status")  # warm the session cache
         self.calls.clear()
         out = self.run_cmd("status")
@@ -255,7 +295,7 @@ class CommandTests(TempHome):
         new = "d" * 24
         self.projects_payload = [{"id": PROJECT, "name": "P"}, {"id": new, "name": "New one"}]
         self.recent = [{"id": USER, "description": "x", "projectId": new,
-                        "timeInterval": {"start": "2026-01-01T00:00:00Z"}}]
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}]
         self.calls.clear()
         out = self.run_cmd("status")
         self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 1)
@@ -281,6 +321,58 @@ class CommandTests(TempHome):
         st = os.stat(path)
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))  # key or account changed
         self.assertTrue(self.run_cmd("cached").get("empty"))
+
+    def test_running_entry_is_not_in_recent(self):
+        self.recent = [
+            {"id": "e" * 24, "description": "Now", "projectId": PROJECT, "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": None}},
+            {"id": "f" * 24, "description": "Done", "projectId": PROJECT, "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}},
+        ]
+        out = self.run_cmd("status")
+        self.assertEqual([e["description"] for e in out["recent"]], ["Done"])
+        self.assertNotIn("_open", json.dumps(out))
+
+    def test_vanished_project_refetches_only_once(self):
+        gone = "9" * 24
+        self.recent = [{"id": USER, "description": "Old", "projectId": gone,
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}]
+        self.run_cmd("status")
+        self.calls.clear()
+        self.run_cmd("status")
+        self.run_cmd("status")
+        self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 0)
+
+    def test_archived_project_still_resolves(self):
+        self.projects_payload = [{"id": PROJECT, "name": "P", "archived": True}]
+        self.recent = [{"id": USER, "description": "Old", "projectId": PROJECT,
+                        "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}]
+        out = self.run_cmd("status")
+        self.assertEqual(out["recent"][0]["project"]["name"], "P")
+        self.assertTrue(out["projects"][0]["archived"])
+
+    def test_rules_forbidden_falls_back_to_no_rules(self):
+        original = self.handler
+        def handler(req):
+            if req.full_url.endswith(f"/workspaces/{WS}"):
+                self.calls.append(("GET", "rules", None))
+                return http_error(403)
+            return original(req)
+        self.handler = handler
+        out = self.run_cmd("status")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["rules"], {"projectRequired": False, "descriptionRequired": False})
+
+    def test_start_reads_description_from_stdin(self):
+        payload = json.dumps({"description": "Secret client work", "projectId": PROJECT}) + "\n"
+        with mock.patch("sys.stdin", io.StringIO(payload)):
+            out = self.run_cmd("start", "--stdin")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["running"]["description"], "Secret client work")
+
+    def test_stdin_rejects_garbage(self):
+        for raw in ("not json\n", "[1]\n", json.dumps({"description": 5}) + "\n", "x" * (clockify.MAX_STDIN + 10)):
+            with mock.patch("sys.stdin", io.StringIO(raw)):
+                out = self.run_cmd("start", "--stdin")
+            self.assertEqual(out["kind"], "input", raw[:20])
 
     def test_start_rejects_bad_project(self):
         out = self.run_cmd("start", "x", "1; rm -rf /")

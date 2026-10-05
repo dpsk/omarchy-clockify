@@ -9,11 +9,15 @@ Commands:
   status [--light]           running entry; full mode adds projects and recents
   cached                     last full status from disk, no network
   start <description> [pid]  stop whatever runs, then start a new entry
+  start --stdin              same, reading {"description", "projectId"} from one
+                             stdin line so the text never appears in argv
   stop                       stop the running entry (no-op when none)
   setup                      interactive: store and verify an API key
 """
 
+import errno
 import getpass
+import http.client
 import json
 import os
 import re
@@ -42,7 +46,8 @@ MAX_DESCRIPTION = 3000
 PROJECTS_TTL_SEC = 3600
 RECENT_FETCH = 30
 RECENT_LIMIT = 8
-USER_AGENT = "omarchy-clockify/1.0"
+USER_AGENT = "omarchy-clockify/1.2.0"
+MAX_STDIN = 16 * 1024
 
 ID_RE = re.compile(r"^[0-9a-f]{24}$")
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
@@ -81,6 +86,8 @@ def load_config(path=None):
     except FileNotFoundError:
         raise ClockifyError("config", "Not configured")
     except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise ClockifyError("config", "Config must be a regular file, not a symlink")
         raise ClockifyError("config", f"Cannot open config: {e.strerror}")
     try:
         st = os.fstat(fd)
@@ -120,6 +127,9 @@ def write_private_json(path, data):
     """Atomically write JSON readable only by the current user."""
     directory = os.path.dirname(path)
     os.makedirs(directory, mode=0o700, exist_ok=True)
+    st = os.lstat(directory)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "Refusing to write into a directory you do not own")
     # mkstemp creates the file 0600; no umask juggling, which would not be
     # thread-safe now that status fetches in parallel.
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".clockify.", suffix=".json.tmp")
@@ -142,23 +152,51 @@ def write_private_json(path, data):
 # ---------------------------------------------------------------- cache
 
 
-def cache_read(name, max_age=None):
-    path = os.path.join(cache_dir(), name)
+def _private_dir_ok(path):
+    """A real directory we own that nobody else can enter (a symlink never passes)."""
     try:
-        st = os.stat(path)
-        if st.st_uid != os.getuid():
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def cache_read(name, max_age=None):
+    """Read a cache file with the same checks as the config: no symlinks,
+    regular file, ours, private. Anything else is treated as a cache miss."""
+    directory = cache_dir()
+    if not _private_dir_ok(directory):
+        return None
+    try:
+        fd = os.open(os.path.join(directory, name), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
             return None
         if max_age is not None and time.time() - st.st_mtime > max_age:
             return None
-        with open(path, "r", encoding="utf-8") as f:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = None
             return json.loads(f.read(MAX_RESPONSE_BYTES))
     except (OSError, ValueError):
         return None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 def cache_write(name, data):
+    directory = cache_dir()
     try:
-        write_private_json(os.path.join(cache_dir(), name), data)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        st = os.lstat(directory)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_mode & 0o077:
+            os.chmod(directory, 0o700)  # tighten a directory someone created loosely
+        if not _private_dir_ok(directory):
+            return
+        write_private_json(os.path.join(directory, name), data)
     except OSError:
         pass  # The cache is an optimization; never fail a command over it.
 
@@ -217,7 +255,7 @@ class Api:
             if e.code in (400, 422) and detail:
                 raise ClockifyError("rejected", detail)
             raise ClockifyError("http", f"Clockify returned HTTP {e.code}")
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError, OSError):
             raise ClockifyError("offline", "Cannot reach Clockify")
 
         if len(raw) > MAX_RESPONSE_BYTES:
@@ -288,6 +326,7 @@ def entry_view(entry):
         "projectId": project_id,
         "project": project if project and project["id"] == project_id else None,
         "start": start,
+        "_open": isinstance(interval, dict) and not interval.get("end"),
     }
 
 
@@ -305,7 +344,9 @@ def recent_view(entries):
     out = []
     for raw in entries if isinstance(entries, list) else []:
         entry = entry_view(raw)
-        if not entry:
+        # The running entry is shown as Current; restarting it from Recent
+        # would only split it in two.
+        if not entry or entry.pop("_open"):
             continue
         key = (entry["description"].lower(), entry["projectId"])
         if key in seen or key == ("", ""):
@@ -348,18 +389,41 @@ def running_entry(api, user_id, workspace):
         f"/workspaces/{workspace}/user/{user_id}/time-entries?in-progress=true&hydrated=true&page-size=1",
     )
     if isinstance(entries, list) and entries:
-        return entry_view(entries[0])
+        entry = entry_view(entries[0])
+        if entry:
+            entry.pop("_open")
+        return entry
     return None
 
 
-def projects(api, workspace, fresh=False):
+def projects(api, workspace, fresh=False, missing=()):
+    """Projects of the workspace, archived ones included (flagged) so old
+    recent entries still resolve. `missing` remembers ids the API does not
+    return at all (deleted, or no access) so they never trigger a refetch."""
     cached = None if fresh else cache_read("projects.json", PROJECTS_TTL_SEC)
     if isinstance(cached, dict) and cached.get("workspaceId") == workspace and isinstance(cached.get("projects"), list):
         return cached["projects"]
-    raw = api.request("GET", f"/workspaces/{workspace}/projects?archived=false&page-size=500&sort-column=NAME")
-    out = [p for p in (project_view(p) for p in (raw if isinstance(raw, list) else [])) if p]
-    cache_write("projects.json", {"workspaceId": workspace, "projects": out})
+    raw = api.request("GET", f"/workspaces/{workspace}/projects?page-size=500&sort-column=NAME")
+    out = []
+    for item in raw if isinstance(raw, list) else []:
+        view = project_view(item)
+        if view:
+            view["archived"] = item.get("archived") is True
+            out.append(view)
+    known = {p["id"] for p in out}
+    cache_write("projects.json", {
+        "workspaceId": workspace,
+        "projects": out,
+        "missing": sorted(i for i in missing if i not in known),
+    })
     return out
+
+
+def known_missing_projects(workspace):
+    cached = cache_read("projects.json")
+    if isinstance(cached, dict) and cached.get("workspaceId") == workspace and isinstance(cached.get("missing"), list):
+        return {i for i in cached["missing"] if safe_id(i)}
+    return set()
 
 
 def workspace_rules(api, workspace):
@@ -367,7 +431,15 @@ def workspace_rules(api, workspace):
     cached = cache_read("rules.json", PROJECTS_TTL_SEC)
     if isinstance(cached, dict) and cached.get("workspaceId") == workspace and isinstance(cached.get("rules"), dict):
         return cached["rules"]
-    raw = api.request("GET", f"/workspaces/{workspace}")
+    try:
+        raw = api.request("GET", f"/workspaces/{workspace}")
+    except ClockifyError as e:
+        if e.kind != "auth":
+            raise
+        # Members without admin rights may not read workspace settings; the
+        # key itself is fine (other calls work). Fall back to "no rules" and
+        # let Clockify's own rejection message explain a refused stop.
+        raw = None
     settings = raw.get("workspaceSettings") if isinstance(raw, dict) else None
     settings = settings if isinstance(settings, dict) else {}
     rules = {
@@ -399,9 +471,10 @@ def cmd_status(api, config, light):
         project_list, rules = projects_f.result(), rules_f.result()
 
     recent = recent_view(recent_raw)
-    known = {p["id"] for p in project_list}
-    if any(e["projectId"] and e["projectId"] not in known for e in recent):
-        project_list = projects(api, workspace, fresh=True)  # a project newer than the cache
+    known = {p["id"] for p in project_list} | known_missing_projects(workspace)
+    unknown = {e["projectId"] for e in recent if e["projectId"] and e["projectId"] not in known}
+    if unknown:  # a project newer than the cache; refetch once, then remember
+        project_list = projects(api, workspace, fresh=True, missing=unknown)
     attach_projects(recent, project_list)
 
     result = {"ok": True, "running": running, "recent": recent, "projects": project_list, "rules": rules}
@@ -447,6 +520,8 @@ def cmd_start(api, config, description, project_id):
         body["projectId"] = project_id
     created = api.request("POST", f"/workspaces/{workspace}/time-entries", body)
     entry = entry_view(created)
+    if entry:
+        entry.pop("_open")
     if entry and entry["projectId"] and not entry["project"]:
         for project in projects(api, workspace):
             if project["id"] == entry["projectId"]:
@@ -507,6 +582,24 @@ def cmd_setup():
     return 0
 
 
+def read_start_stdin(stream=None):
+    stream = stream or sys.stdin
+    line = stream.readline(MAX_STDIN + 1)
+    if len(line) > MAX_STDIN:
+        raise ClockifyError("input", "Input too large")
+    try:
+        data = json.loads(line or "null")
+    except ValueError:
+        raise ClockifyError("input", "Malformed input")
+    if not isinstance(data, dict):
+        raise ClockifyError("input", "Malformed input")
+    description = data.get("description")
+    project_id = data.get("projectId") or ""
+    if not isinstance(description, str) or not isinstance(project_id, str):
+        raise ClockifyError("input", "Malformed input")
+    return description, project_id
+
+
 def run(argv, config_loader=load_config, api_factory=Api):
     if not argv or argv[0] in ("-h", "--help"):
         return {"ok": False, "kind": "usage", "error": "usage: clockify.py status|cached|start|stop|setup"}
@@ -518,6 +611,9 @@ def run(argv, config_loader=load_config, api_factory=Api):
         api = api_factory(config)
         if command == "status":
             return cmd_status(api, config, light="--light" in args)
+        if command == "start" and args == ["--stdin"]:
+            description, project_id = read_start_stdin()
+            return cmd_start(api, config, description, project_id)
         if command == "start":
             if not args or len(args) > 2:
                 raise ClockifyError("usage", "usage: clockify.py start <description> [projectId]")

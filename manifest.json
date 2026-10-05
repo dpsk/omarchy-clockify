@@ -1,8 +1,8 @@
 {
   "schemaVersion": 1,
   "id": "dpsk.clockify",
-  "name": "Clockify",
-  "version": "1.1.0",
+  "name": "Clockify Timer",
+  "version": "1.2.0",
   "author": "dpsk",
   "license": "MIT",
   "description": "Minimal Clockify time tracker in the Omarchy bar: start, stop, and restart timers.",
@@ -11,7 +11,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Clockify",
+    "displayName": "Clockify Timer",
     "description": "Running timer in the bar; a popup to start, stop, and restart Clockify time entries.",
     "category": "Productivity",
     "aliases": ["clockify", "time-tracking", "timer"],

@@ -24,13 +24,20 @@ that the Clockify API key is never part of that scene:
 - Requests go only to a fixed allowlist of Clockify API hosts over verified
   TLS. Redirects are refused so the key header cannot be forwarded to
   another host. Responses are capped at 2 MB and time out after 10 seconds.
-- Error messages are fixed strings; unexpected exceptions are reported as an
-  opaque "Unexpected error" so no request details leak into the UI.
+- Error messages are fixed strings, except that when Clockify rejects a
+  request (HTTP 400/422) the panel shows Clockify's own explanation,
+  sanitized and cut to 200 characters. Unexpected exceptions are reported as
+  an opaque "Unexpected error", so no request details leak into the UI.
+- Entry descriptions are passed to the helper over stdin, not argv, so other
+  local users can't read them from `/proc/<pid>/cmdline`.
+- Cache files get the same checks as the config: no symlinks, regular
+  files only, owned by you, mode 600, inside a directory that is yours and
+  mode 700 (tightened automatically if it was created looser).
 - Data coming back from Clockify (descriptions, project names, colors) is
   sanitized in the helper and rendered as plain text in QML, so it cannot
   inject rich text, links, or images.
 
-The cache in `~/.cache/omarchy-clockify/` (directory mode 700, files mode 600)
+The cache in `~/.cache/omarchy-clockify/`
 holds your user id, workspace id, project names and colors, workspace rules,
 and a snapshot of your recent entries' descriptions, so the panel can open
 without waiting on the network. It never holds the key. The snapshot is tied
