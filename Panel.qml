@@ -1090,44 +1090,97 @@ Panel {
             }
           }
 
-          TextField {
-            id: descField
+          // Multi-line description, like the editor's: Enter starts,
+          // Shift+Enter starts a new line.
+          Flickable {
+            id: descFlick
             width: parent.width
-            placeholderText: "What are you working on?"
-            foreground: root.foreground
+            height: Math.min(descField.implicitHeight, Style.space(150))
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            QQC.TextArea.flickable: QQC.TextArea {
+              id: descField
+              textFormat: TextEdit.PlainText
+              wrapMode: TextEdit.Wrap
+              placeholderText: "What are you working on?"
+              selectByMouse: true
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              color: root.foreground
+              selectionColor: Style.selectionFillFor(root.foreground, Color.accent)
+              selectedTextColor: root.foreground
+              placeholderTextColor: Qt.darker(root.foreground, 1.6)
+              readonly property var _borderSpec: Border.controlSpec(activeFocus ? "focus" : (hovered ? "hover-cursor" : "normal"), root.foreground, Color.accent)
+              leftPadding: Style.spacing.controlPaddingX + Border.left(_borderSpec)
+              rightPadding: Style.spacing.controlPaddingX + Border.right(_borderSpec)
+              topPadding: Style.spacing.inputPaddingY + Border.top(_borderSpec)
+              bottomPadding: Style.spacing.inputPaddingY + Border.bottom(_borderSpec)
+              background: BorderSurface {
+                color: Style.controlFill(descField.activeFocus, descField.hovered, root.foreground, Color.accent)
+                borderSpec: descField._borderSpec
+                radius: Style.cornerRadius
+              }
+
+              // Only a change that differs from the draft is the user's
+              // typing; the mirror below writes the draft back unchanged.
+              onTextChanged: {
+                if (length > 3000) remove(3000, length)
+                if (text !== root.draftDescription) {
+                  root.draftDescription = text
+                  root.recentIndex = -1
+                }
+              }
+              // The popup content is rebuilt on every open, and the draft
+              // survives a close, so show it again with the cursor at the end.
+              Component.onCompleted: { text = root.draftDescription; cursorPosition = length }
+              // Typing replaces the text; mirror resets after a start.
+              Connections {
+                target: root
+                function onDraftDescriptionChanged() {
+                  if (descField.text !== root.draftDescription) descField.text = root.draftDescription
+                }
+              }
+              // Up/Down move the cursor between lines; they step through
+              // Recent once a recent entry is highlighted, or when Down is
+              // pressed on the last visual line.
+              function cursorOnLastLine() {
+                return cursorRectangle.y >= positionToRectangle(length).y
+              }
+              Keys.onPressed: function(event) {
+                var ctrl = event.modifiers & Qt.ControlModifier
+                if (event.key === Qt.Key_Escape) {
+                  root.close(); event.accepted = true
+                } else if (ctrl && event.key === Qt.Key_E) {
+                  // The field claims Ctrl+E (end of line) before the window
+                  // Shortcut sees it, so handle it here as well.
+                  root.editHighlighted(); event.accepted = true
+                } else if (ctrl && event.key === Qt.Key_H) {
+                  root.showHistory(); event.accepted = true
+                } else if (event.key === Qt.Key_Down && (root.recentIndex >= 0 || cursorOnLastLine())) {
+                  root.recentIndex = Math.min(root.recent.length - 1, root.recentIndex + 1); event.accepted = true
+                } else if (event.key === Qt.Key_Up && root.recentIndex >= 0) {
+                  root.recentIndex = root.recentIndex - 1; event.accepted = true
+                } else if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter) && !(event.modifiers & Qt.ShiftModifier)) {
+                  root.startDraft(); event.accepted = true
+                } else if (event.key === Qt.Key_Tab) {
+                  if (root.pickerOpen && newPicker.item) newPicker.item.focusFilter()
+                  else root.pickerOpen = true
+                  event.accepted = true
+                }
+              }
+            }
+            QQC.ScrollBar.vertical: QQC.ScrollBar {}
+          }
+
+          Text {
+            width: parent.width
+            textFormat: Text.PlainText
+            text: "Enter starts  ·  Shift+Enter new line  ·  Tab project"
+            color: root.dim
             font.family: root.fontFamily
-            maximumLength: 3000
-            text: root.draftDescription
-            onTextEdited: { root.draftDescription = text; root.recentIndex = -1 }
-            // Typing breaks the text binding; mirror resets after a start.
-            Connections {
-              target: root
-              function onDraftDescriptionChanged() {
-                if (descField.text !== root.draftDescription) descField.text = root.draftDescription
-              }
-            }
-            Keys.onPressed: function(event) {
-              var ctrl = event.modifiers & Qt.ControlModifier
-              if (event.key === Qt.Key_Escape) {
-                root.close(); event.accepted = true
-              } else if (ctrl && event.key === Qt.Key_E) {
-                // The field claims Ctrl+E (end of line) before the window
-                // Shortcut sees it, so handle it here as well.
-                root.editHighlighted(); event.accepted = true
-              } else if (ctrl && event.key === Qt.Key_H) {
-                root.showHistory(); event.accepted = true
-              } else if (event.key === Qt.Key_Down) {
-                root.recentIndex = Math.min(root.recent.length - 1, root.recentIndex + 1); event.accepted = true
-              } else if (event.key === Qt.Key_Up) {
-                root.recentIndex = Math.max(-1, root.recentIndex - 1); event.accepted = true
-              } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-                root.startDraft(); event.accepted = true
-              } else if (event.key === Qt.Key_Tab) {
-                if (root.pickerOpen && newPicker.item) newPicker.item.focusFilter()
-                else root.pickerOpen = true
-                event.accepted = true
-              }
-            }
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
 
           Row {

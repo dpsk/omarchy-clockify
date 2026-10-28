@@ -54,7 +54,7 @@ HISTORY_FETCH = 100
 CLOCK_SKEW_SEC = 60
 # Bumped when the snapshot's shape changes, so an older one is not shown.
 STATE_SCHEMA = 2
-USER_AGENT = "omarchy-clockify/1.3.0"
+USER_AGENT = "omarchy-clockify/1.3.1"
 MAX_STDIN = 16 * 1024
 
 ID_RE = re.compile(r"^[0-9a-f]{24}$")

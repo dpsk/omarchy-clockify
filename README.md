@@ -6,7 +6,8 @@ opens a small popup with:
 
 - **Current**: what's running, for how long, and Edit and Stop buttons. Click
   the project name to open that project on clockify.me.
-- **New**: a description and an optional project. Press Enter to start.
+- **New**: a description (multi-line) and an optional project. Press Enter to
+  start, Shift+Enter for a new line.
 - **Recent**: your last few distinct entries. Click one to restart it.
 - **History** (button next to New): every entry from the last 7 days, grouped
   by day with daily totals. Click one to edit it, press its play button to
@@ -61,7 +62,8 @@ with `omarchy-shell dpsk.clockify history` or `... edit`.
 | Bar icon | Left click | Open or close the panel |
 | Bar icon | Middle click | Stop the running timer |
 | Description field | <kbd>Enter</kbd> | Start the timer (or restart the highlighted recent entry) |
-| Description field | <kbd>↑</kbd> / <kbd>↓</kbd> | Highlight a recent entry |
+| Description field | <kbd>Shift</kbd>+<kbd>Enter</kbd> | Start a new line |
+| Description field | <kbd>↑</kbd> / <kbd>↓</kbd> | Move between lines; <kbd>↓</kbd> on the last line highlights a recent entry, then both step through Recent |
 | Description field | <kbd>Tab</kbd> | Open the project picker |
 | Project picker | Type, <kbd>↑</kbd>/<kbd>↓</kbd>, <kbd>Enter</kbd> or <kbd>Tab</kbd> | Filter and choose a project |
 | Project picker | <kbd>Esc</kbd> | Close the picker |
