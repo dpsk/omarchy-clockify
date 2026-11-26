@@ -35,7 +35,8 @@ that the Clockify API key is never part of that scene:
   the configured user and workspace and isn't locked, so even an admin's key
   is never used on someone else's entries. Clockify's update replaces the
   whole entry, so the helper re-sends the fields the panel doesn't show
-  (tags, task, billable, custom fields) with every edit.
+  (tags, task, billable, custom fields) with every edit. Billable changes
+  only when an entry moves to another project, to that project's default.
 - Cache files get the same checks as the config: no symlinks, regular
   files only, owned by you, mode 600, inside a directory that is yours and
   mode 700 (tightened automatically if it was created looser).
@@ -46,7 +47,7 @@ that the Clockify API key is never part of that scene:
   character is dropped.
 
 The cache in `~/.cache/omarchy-clockify/` holds your user id, workspace id,
-project names, colors and client names, workspace rules, and a snapshot of
+project names, colors, client names and billable flags, workspace rules, and a snapshot of
 your recent entries, your entries from the last 7 days, and the running entry
 (descriptions, entry ids, start and end times, project ids), so the panel can
 open without waiting on the network. It

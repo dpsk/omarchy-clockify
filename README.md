@@ -86,8 +86,17 @@ Times in the editor are typed as `9:30`, `0930` or `9.30` and apply to the
 entry's own day. Clockify's update replaces the whole entry, so the helper
 re-reads it and sends back what the panel doesn't show (tags, task, billable
 status, custom fields) alongside your change. A task is dropped when you move
-the entry to another project, since tasks belong to their project. Multi-line descriptions show
-their first line (with `…`) in the bar tooltip, Current, Recent and History.
+the entry to another project, since tasks belong to their project.
+
+New entries are billable when their project is billable, as in Clockify's own
+apps (its API would otherwise create every entry non-billable). Moving an
+entry to another project in the editor gives it that project's billable
+status; any other edit keeps the entry's own. If Clockify refuses to let you
+set billable (some workspaces let only admins change it), the entry is saved
+without that change.
+
+Multi-line descriptions show their first line (with `…`) in the bar tooltip,
+Current, Recent and History.
 
 IPC:
 

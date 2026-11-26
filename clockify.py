@@ -54,7 +54,7 @@ HISTORY_FETCH = 100
 CLOCK_SKEW_SEC = 60
 # Bumped when the snapshot's shape changes, so an older one is not shown.
 STATE_SCHEMA = 2
-USER_AGENT = "omarchy-clockify/1.3.1"
+USER_AGENT = "omarchy-clockify/1.3.2"
 MAX_STDIN = 16 * 1024
 
 ID_RE = re.compile(r"^[0-9a-f]{24}$")
@@ -480,6 +480,7 @@ def projects(api, workspace, fresh=False, missing=()):
         view = project_view(item)
         if view:
             view["archived"] = item.get("archived") is True
+            view["billable"] = item.get("billable") is True
             out.append(view)
     known = {p["id"] for p in out}
     cache_write("projects.json", {
@@ -488,6 +489,23 @@ def projects(api, workspace, fresh=False, missing=()):
         "missing": sorted(i for i in missing if i not in known),
     })
     return out
+
+
+def find_project(api, workspace, project_id):
+    """One project from the list. Refetched once if the cached copy predates
+    the project or the billable flag; an id the fresh list still lacks is
+    remembered as missing, so it never costs a refetch again."""
+    missing = known_missing_projects(workspace)
+    for project in projects(api, workspace, missing=missing):
+        if project["id"] == project_id and "billable" in project:
+            return project
+    if project_id in missing:
+        return None
+    for project in projects(api, workspace, fresh=True, missing=missing | {project_id}):
+        if project["id"] == project_id:
+            return project
+    return None
+
 
 
 def known_missing_projects(workspace):
@@ -523,6 +541,11 @@ def workspace_rules(api, workspace):
 
 # ---------------------------------------------------------------- commands
 
+# Clockify does not document whether members may set billable when only
+# admins can change it; if it refuses, the entry goes through without it.
+BILLABLE_REFUSED = ("auth", "rejected")
+
+
 
 def cmd_status(api, config, light):
     user_id, workspace = session(config, api)
@@ -536,7 +559,7 @@ def cmd_status(api, config, light):
         running_f = pool.submit(running_entry, api, user_id, workspace)
         recent_f = pool.submit(api.request, "GET", f"{entries}?page-size={RECENT_FETCH}")
         history_f = pool.submit(api.request, "GET", f"{entries}?page-size={HISTORY_FETCH}&start={history_since()}")
-        projects_f = pool.submit(projects, api, workspace)
+        projects_f = pool.submit(projects, api, workspace, missing=known_missing_projects(workspace))
         rules_f = pool.submit(workspace_rules, api, workspace)
         running, recent_raw, history_raw = running_f.result(), recent_f.result(), history_f.result()
         project_list, rules = projects_f.result(), rules_f.result()
@@ -546,7 +569,7 @@ def cmd_status(api, config, light):
     known = {p["id"] for p in project_list} | known_missing_projects(workspace)
     unknown = {e["projectId"] for e in recent + history if e["projectId"] and e["projectId"] not in known}
     if unknown:  # a project newer than the cache; refetch once, then remember
-        project_list = projects(api, workspace, fresh=True, missing=unknown)
+        project_list = projects(api, workspace, fresh=True, missing=unknown | known_missing_projects(workspace))
     attach_projects(recent, project_list)
     attach_projects(history, project_list)
 
@@ -592,6 +615,10 @@ def cmd_start(api, config, description, project_id):
         raise ClockifyError("input", "This workspace requires a project")
     if rules["descriptionRequired"] and not description:
         raise ClockifyError("input", "This workspace requires a description")
+    # Clockify's own apps take the entry's billable status from the project;
+    # its API does not, and would create every entry non-billable. Looked up
+    # before anything changes, so a failed lookup leaves the old timer running.
+    project = find_project(api, workspace, project_id) if project_id else None
     stamp = now_iso()
     # Close the running entry at the same instant the new one starts so the
     # two never overlap, whatever the server's own switching behavior is.
@@ -599,16 +626,21 @@ def cmd_start(api, config, description, project_id):
     body = {"start": stamp, "description": description}
     if project_id:
         body["projectId"] = project_id
-    created = api.request("POST", f"/workspaces/{workspace}/time-entries", body)
+    if project and project["billable"]:
+        body["billable"] = True
+    try:
+        created = api.request("POST", f"/workspaces/{workspace}/time-entries", body)
+    except ClockifyError as e:
+        if "billable" not in body or e.kind not in BILLABLE_REFUSED:
+            raise
+        del body["billable"]
+        created = api.request("POST", f"/workspaces/{workspace}/time-entries", body)
     entry = entry_view(created)
     if entry:
         entry.pop("_open")
         entry.pop("end")
-    if entry and entry["projectId"] and not entry["project"]:
-        for project in projects(api, workspace):
-            if project["id"] == entry["projectId"]:
-                entry["project"] = project
-                break
+    if entry and entry["projectId"] and not entry["project"] and project and project["id"] == entry["projectId"]:
+        entry["project"] = project
     return {"ok": True, "running": entry}
 
 
@@ -633,12 +665,14 @@ def own_entry(api, user_id, workspace, entry_id):
     return entry
 
 
-def updated_body(entry, changes, rules, now=None):
+def updated_body(entry, changes, rules, now=None, project_billable=None):
     """The full PUT body for an edited entry.
 
     Clockify's update replaces the whole entry, so everything the panel does
     not edit (tags, task, billable, custom fields, type) is carried over from
-    the fetched entry; dropping it would silently clear it.
+    the fetched entry; dropping it would silently clear it. The one exception
+    is billable when the entry moves to another project: `project_billable`
+    is that project's default, which the entry takes, as in Clockify's apps.
     """
     interval = entry.get("timeInterval") if isinstance(entry.get("timeInterval"), dict) else {}
     old_start, old_end = interval.get("start"), interval.get("end")
@@ -683,7 +717,10 @@ def updated_body(entry, changes, rules, now=None):
     if rules["descriptionRequired"] and not description.strip():
         raise ClockifyError("input", "This workspace requires a description")
 
-    body = {"start": start_s, "description": description, "billable": entry.get("billable") is True}
+    billable = entry.get("billable") is True
+    if project_id and project_id != safe_id(entry.get("projectId")) and project_billable is not None:
+        billable = project_billable
+    body = {"start": start_s, "description": description, "billable": billable}
     if not running:
         body["end"] = end_s
     if project_id:
@@ -712,8 +749,21 @@ def updated_body(entry, changes, rules, now=None):
 def cmd_update(api, config, changes):
     user_id, workspace = session(config, api)
     entry = own_entry(api, user_id, workspace, changes.get("id"))
-    body = updated_body(entry, changes, workspace_rules(api, workspace))
-    api.request("PUT", f"/workspaces/{workspace}/time-entries/{entry['id']}", body)
+    new_project = changes.get("projectId") or ""
+    billable = None
+    if new_project and ID_RE.match(new_project) and new_project != safe_id(entry.get("projectId")):
+        project = find_project(api, workspace, new_project)
+        billable = project["billable"] if project else None
+    body = updated_body(entry, changes, workspace_rules(api, workspace), project_billable=billable)
+    path = f"/workspaces/{workspace}/time-entries/{entry['id']}"
+    own = entry.get("billable") is True
+    try:
+        api.request("PUT", path, body)
+    except ClockifyError as e:
+        if body["billable"] == own or e.kind not in BILLABLE_REFUSED:
+            raise
+        body["billable"] = own
+        api.request("PUT", path, body)
     return {"ok": True, "running": running_entry(api, user_id, workspace)}
 
 

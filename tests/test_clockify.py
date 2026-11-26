@@ -314,6 +314,68 @@ class CommandTests(TempHome):
         self.assertEqual(out["running"]["description"], "Write code")
         self.assertEqual(out["running"]["project"]["name"], "P")
 
+    def post_body(self):
+        posts = [c for c in self.calls if c[0] == "POST"]
+        self.assertEqual(len(posts), 1)
+        return json.loads(posts[0][2])
+
+    def test_start_takes_billable_from_project(self):
+        self.projects_payload = [{"id": PROJECT, "name": "P", "billable": True}]
+        out = self.run_cmd("start", "x", PROJECT)
+        self.assertTrue(out["ok"], out)
+        self.assertIs(self.post_body()["billable"], True)
+
+    def test_start_without_billable_project_is_not_billable(self):
+        out = self.run_cmd("start", "x", PROJECT)
+        self.assertNotIn("billable", self.post_body())
+        self.calls.clear()
+        self.run_cmd("start", "x")
+        self.assertNotIn("billable", self.post_body())
+
+    def test_start_refetches_projects_cached_without_billable(self):
+        clockify.cache_write("projects.json", {"workspaceId": WS, "projects": [
+            {"id": PROJECT, "name": "P", "client": "", "color": "", "archived": False}]})
+        self.projects_payload = [{"id": PROJECT, "name": "P", "billable": True}]
+        self.run_cmd("start", "x", PROJECT)
+        self.assertIs(self.post_body()["billable"], True)
+        self.calls.clear()
+        self.run_cmd("start", "x", PROJECT)
+        self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 0)
+
+    def test_start_project_lookup_failure_leaves_old_timer_running(self):
+        original = self.handler
+        def handler(req):
+            if "/projects" in req.full_url:
+                self.calls.append(("GET", "projects", None))
+                return http_error(429)
+            return original(req)
+        self.handler = handler
+        out = self.run_cmd("start", "x", PROJECT)
+        self.assertEqual(out["kind"], "rate")
+        self.assertFalse([c for c in self.calls if c[0] in ("PATCH", "POST")])
+
+    def test_start_unlisted_project_refetches_only_once(self):
+        gone = "9" * 24
+        self.run_cmd("start", "x", gone)
+        self.calls.clear()
+        out = self.run_cmd("start", "x", gone)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 0)
+        self.assertNotIn("billable", self.post_body())
+
+    def test_start_retries_without_billable_when_refused(self):
+        self.projects_payload = [{"id": PROJECT, "name": "P", "billable": True}]
+        original = self.handler
+        def handler(req):
+            if req.get_method() == "POST" and "billable" in json.loads(req.data):
+                self.calls.append(("POST-refused", "", req.data))
+                return http_error(403)
+            return original(req)
+        self.handler = handler
+        out = self.run_cmd("start", "x", PROJECT)
+        self.assertTrue(out["ok"], out)
+        self.assertNotIn("billable", self.post_body())
+
     def test_full_status_fetches_in_parallel_and_attaches_projects(self):
         self.recent = [{"id": USER, "description": "Docs", "projectId": PROJECT,
                         "timeInterval": {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}}]
@@ -372,6 +434,17 @@ class CommandTests(TempHome):
         self.run_cmd("status")
         self.calls.clear()
         self.run_cmd("status")
+        self.run_cmd("status")
+        self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 0)
+
+    def test_missing_projects_accumulate_across_statuses(self):
+        first, second = "8" * 24, "9" * 24
+        done = {"start": "2026-01-01T00:00:00Z", "end": "2026-01-01T01:00:00Z"}
+        self.recent = [{"id": USER, "description": "a", "projectId": first, "timeInterval": done}]
+        self.run_cmd("status")
+        self.recent.append({"id": USER, "description": "b", "projectId": second, "timeInterval": done})
+        self.run_cmd("status")
+        self.calls.clear()
         self.run_cmd("status")
         self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 0)
 
@@ -466,9 +539,52 @@ class CommandTests(TempHome):
         self.assertNotIn("taskId", body)  # the task belonged to the old project
         self.assertEqual(body["description"], "Old")
 
+    def test_update_to_another_project_takes_its_billable(self):
+        other = "d" * 24
+        self.projects_payload = [{"id": PROJECT, "name": "P", "billable": True},
+                                 {"id": other, "name": "O", "billable": False}]
+        self.run_stdin("update", {"id": ENTRY, "projectId": other})
+        self.assertIs(self.put_body()["billable"], False)
+        self.calls.clear()
+        self.entry["billable"] = False
+        self.entry["projectId"] = other
+        self.run_stdin("update", {"id": ENTRY, "projectId": PROJECT})
+        self.assertIs(self.put_body()["billable"], True)
+
+    def test_update_to_unlisted_or_new_project(self):
+        self.projects_payload = [{"id": PROJECT, "name": "P", "billable": True}]
+        self.run_stdin("update", {"id": ENTRY, "projectId": "d" * 24})
+        self.assertIs(self.put_body()["billable"], True)  # unknown project: keep the entry's own
+        self.calls.clear()
+        self.entry.pop("projectId")
+        self.entry["billable"] = False
+        self.run_stdin("update", {"id": ENTRY, "projectId": PROJECT})
+        self.assertIs(self.put_body()["billable"], True)
+
+    def test_update_retries_with_own_billable_when_refused(self):
+        other = "d" * 24
+        self.projects_payload = [{"id": other, "name": "O", "billable": False}]
+        original = self.handler
+        def handler(req):
+            if req.get_method() == "PUT" and json.loads(req.data)["billable"] is False:
+                return http_error(403)
+            return original(req)
+        self.handler = handler
+        out = self.run_stdin("update", {"id": ENTRY, "projectId": other})
+        self.assertTrue(out["ok"], out)
+        self.assertIs(self.put_body()["billable"], True)
+
+    def test_update_same_project_keeps_billable(self):
+        self.projects_payload = [{"id": PROJECT, "name": "P", "billable": False}]
+        self.run_stdin("update", {"id": ENTRY, "description": "y"})
+        self.assertIs(self.put_body()["billable"], True)
+        self.assertEqual(sum("/projects" in p for _, p, _ in self.calls), 0)
+
     def test_update_can_clear_project(self):
         self.run_stdin("update", {"id": ENTRY, "projectId": ""})
-        self.assertNotIn("projectId", self.put_body())
+        body = self.put_body()
+        self.assertNotIn("projectId", body)
+        self.assertIs(body["billable"], True)
 
     def test_update_running_entry_keeps_it_running(self):
         self.entry["timeInterval"] = {"start": "2026-01-01T09:00:00Z", "end": None}

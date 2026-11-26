@@ -1609,6 +1609,10 @@ Panel {
                 if (length > 3000) remove(3000, length)
                 if (text !== root.editDescription) root.editDescription = text
               }
+              // The popup's contents are rebuilt on every open, and opening the
+              // editor on the same entry again does not change editDescription,
+              // so the mirror below would never fire: start from it here.
+              Component.onCompleted: text = root.editDescription
               Connections {
                 target: root
                 function onEditDescriptionChanged() {
